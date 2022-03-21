@@ -1,3 +1,6 @@
+import math
+
+import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoModel
@@ -57,31 +60,18 @@ class BERTAttention(nn.Module):
         Returns:
             torch.Tensor: The representation of the sequence.
         """
-        if input_ids.size(-1) <= self.lm_window:
-            return self.lm(input_ids, attention_mask=input_ids != self.lm.config.pad_token_id)[0]
-        else:
-            inputs = []
-            batch_indexes = []
-            seq_lengths = []
-            for token_id in input_ids:
-                indexes = []
-                seq_length = (token_id != self.lm.config.pad_token_id).sum()
-                seq_lengths.append(seq_length)
-                for i in range(0, seq_length, self.lm_window):
-                    indexes.append(len(inputs))
-                    inputs.append(token_id[i: i + self.lm_window])
-                batch_indexes.append(indexes)
+        batch_size, batch_len = input_ids.shape
+        pad_token_id = self.lm.config.pad_token_id
+        mask = input_ids == pad_token_id
+        chunks = torch.split(input_ids, self.lm_window, dim=1) # (n_chunk, batch_size, lm_window)
+        chunks = sum(map(list, chunks), []) # (n_chunk * batch_size, lm_window)
+        chunks = pad_sequence(chunks, batch_first=True, padding_value=pad_token_id)
+        last_hidden_states = self.lm(
+            chunks, attention_mask=chunks != pad_token_id)[0] # (n_chunk * batch_size, lm_window, n_feature)
+        out = torch.cat(torch.split(last_hidden_states, batch_size), dim=1) # (batch_size, n_chunk * lm_window, n_feature)
+        out = out[:,:batch_len,:].masked_fill_(mask[:,:,None], 0)
 
-            padded_inputs = pad_sequence(inputs, batch_first=True)
-            last_hidden_states = self.lm(
-                padded_inputs, attention_mask=padded_inputs != self.lm.config.pad_token_id)[0]
-
-            x = []
-            for seq_l, mapping in zip(seq_lengths, batch_indexes):
-                last_hidden_state = last_hidden_states[mapping].view(
-                    -1, last_hidden_states.size(-1))[:seq_l, :]
-                x.append(last_hidden_state)
-            return pad_sequence(x, batch_first=True)
+        return out
 
     def forward(self, input):
         input_ids = input['text'] # (batch_size, sequence_length)
